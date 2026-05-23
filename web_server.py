@@ -2,19 +2,17 @@
 Flask Web Server for Knowledge Graph Visualization
 """
 import os
-import json
 import time
 import secrets
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
-from threading import Thread
 from knowledge_graph_service import KnowledgeGraphService
 from config import WEB_HOST, WEB_PORT, WEB_DEBUG
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = secrets.token_hex(32)
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
+socketio = SocketIO(app, cors_allowed_origins=["http://localhost:5000", "http://127.0.0.1:5000"])
 
 # Global service instance
 kg_service = None
@@ -31,7 +29,9 @@ def get_stats():
     """Get current statistics"""
     if kg_service:
         return jsonify(kg_service.get_statistics())
-    return jsonify({})
+    return jsonify({'total_files': 0, 'total_entities': 0, 'total_relationships': 0,
+                    'files_processed': 0, 'entities_extracted': 0, 'relationships_extracted': 0,
+                    'last_update_time': None})
 
 
 @app.route('/api/graph')
@@ -66,7 +66,9 @@ def get_entity(entity_id):
     """Get entity details"""
     if kg_service:
         entity = kg_service.db.get_entity_details(entity_id)
-        return jsonify(entity) if entity else jsonify({'error': 'Not found'}), 404
+        if entity:
+            return jsonify(entity)
+        return jsonify({'error': 'Not found'}), 404
     return jsonify({'error': 'Service not available'}), 503
 
 
@@ -85,11 +87,17 @@ def handle_disconnect():
 
 def broadcast_update(file_path: str, stats: dict):
     """Broadcast update to all connected clients"""
-    socketio.emit('file_updated', {
-        'file_path': file_path,
-        'stats': stats,
-        'timestamp': time.time()
-    })
+    # [CRITICAL-2] daemon 线程中调用需要 Flask 应用上下文
+    # [R3-17] 关闭期间 emit 可能异常，需要捕获
+    try:
+        with app.app_context():
+            socketio.emit('file_updated', {
+                'file_path': file_path,
+                'stats': stats,
+                'timestamp': time.time()
+            })
+    except Exception as e:
+        print(f"[WARN] Failed to broadcast update: {e}")
 
 
 def run_server(service: KnowledgeGraphService, host: str = None, port: int = None):
@@ -104,7 +112,8 @@ def run_server(service: KnowledgeGraphService, host: str = None, port: int = Non
     port = port or WEB_PORT
     
     print(f"Starting web server on http://{host}:{port}")
-    socketio.run(app, host=host, port=port, debug=WEB_DEBUG, allow_unsafe_werkzeug=True)
+    socketio.run(app, host=host, port=port, debug=WEB_DEBUG,
+                 allow_unsafe_werkzeug=WEB_DEBUG)
 
 
 if __name__ == '__main__':

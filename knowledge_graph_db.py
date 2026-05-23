@@ -7,7 +7,6 @@ import os
 import json
 import hashlib
 import time
-from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from contextlib import contextmanager
 from database_schema import SCHEMA_SQL
@@ -44,6 +43,13 @@ class KnowledgeGraphDB:
                 conn.execute("PRAGMA foreign_keys=ON")
                 break
             except sqlite3.OperationalError as e:
+                # [R3-09] PRAGMA失败时关闭已创建的连接，防止泄漏
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
                 if attempt < max_retries - 1:
                     time.sleep(0.1 * (attempt + 1))
                 else:
@@ -68,11 +74,11 @@ class KnowledgeGraphDB:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA_SQL)
     
-    def compute_file_hash(self, content: str) -> bytes:
-        """Compute SHA256 hash of file content"""
-        return hashlib.sha256(content.encode('utf-8')).digest()
+    def compute_file_hash(self, content: str) -> str:
+        """Compute SHA256 hash of file content (returns hex string for consistent storage)"""
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
     
-    def file_exists_and_unchanged(self, file_path: str, content: str) -> Tuple[bool, Optional[bytes]]:
+    def file_exists_and_unchanged(self, file_path: str, content: str) -> Tuple[bool, Optional[str]]:
         """Check if file exists with same hash"""
         file_path = self._normalize_path(file_path)
         new_hash = self.compute_file_hash(content)
@@ -88,9 +94,6 @@ class KnowledgeGraphDB:
                 return False, new_hash
             
             stored_hash = row['hash']
-            if isinstance(stored_hash, str):
-                stored_hash = stored_hash.encode('utf-8')
-            
             return stored_hash == new_hash, new_hash
     
     def add_or_update_file(self, file_path: str, content: str) -> int:
@@ -150,7 +153,7 @@ class KnowledgeGraphDB:
             return cursor.fetchone()['id']
     
     def add_entities_batch(self, file_id: int, entities: List[Dict]) -> List[int]:
-        """Add multiple entities in a single transaction (optimized with executemany)"""
+        """Add multiple entities in a single transaction"""
         if not entities:
             return []
 
@@ -208,6 +211,9 @@ class KnowledgeGraphDB:
                         source_entity_id: int = None, target_entity_id: int = None,
                         target_file_id: int = None) -> int:
         """Add a relationship between entities"""
+        # [R3-12] 验证必要参数，防止NULL entity_id产生无法清理的垃圾数据
+        if source_entity_id is None or target_entity_id is None:
+            raise ValueError("source_entity_id and target_entity_id must not be None")
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """INSERT INTO relationships
@@ -424,16 +430,27 @@ class KnowledgeGraphDB:
             print(f"[WARN] WAL checkpoint failed during close: {e}")
     
     def update_file_transaction(self, file_path: str, content: str,
-                                 parse_result=None, callback=None):
-        """Execute delete + insert in a single connection for atomicity."""
+                                 parse_result=None, callback=None) -> bool:
+        """Execute delete + insert in a single connection for atomicity.
+        
+        [CRITICAL#2] 将 hash 检查合并到事务内，消除 TOCTOU 竞态条件。
+        Returns True if file was actually updated, False if unchanged.
+        """
         file_path = self._normalize_path(file_path)
+        file_hash = self.compute_file_hash(content)
         with self._get_connection() as conn:
-            # [CRITICAL#3] 使用 INSERT OR REPLACE 避免 UNIQUE 约束冲突
+            # [CRITICAL#2] 在同一事务中检查 hash，避免竞态
+            cursor = conn.execute("SELECT hash FROM files WHERE path = ?", (file_path,))
+            row = cursor.fetchone()
+            if row:
+                stored_hash = row['hash']
+                if stored_hash == file_hash:
+                    return False  # 文件未变化，跳过
+
             # 先删除关联数据（entities/relationships/imports 通过 CASCADE 自动删除）
             conn.execute("DELETE FROM files WHERE path = ?", (file_path,))
 
             # Add/update the file (DELETE已保证唯一性，使用INSERT即可)
-            file_hash = self.compute_file_hash(content)
             cursor = conn.execute(
                 """INSERT INTO files (path, hash, modified)
                    VALUES (?, ?, strftime('%s', 'now')) RETURNING id""",
@@ -444,3 +461,4 @@ class KnowledgeGraphDB:
             # Execute callback if provided
             if callback:
                 callback(conn, file_id, parse_result)
+            return True

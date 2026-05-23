@@ -3,13 +3,13 @@ File Watcher Module
 Monitors ArkTS files for changes with debouncing
 """
 import os
-import time
+import re
 import threading
 from pathlib import Path
-from typing import Callable, Set, Dict
+from typing import Callable, Dict
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreatedEvent, FileDeletedEvent
-from config import WATCH_DELAY_SECONDS, SUPPORTED_EXTENSIONS, MIN_FILE_WORDS
+from config import WATCH_DELAY_SECONDS, SUPPORTED_EXTENSIONS, MIN_FILE_WORDS, MAX_FILE_SIZE
 
 
 class ArkTSFileHandler(FileSystemEventHandler):
@@ -39,7 +39,6 @@ class ArkTSFileHandler(FileSystemEventHandler):
     
     def _extract_words(self, text: str) -> list:
         """Extract words from camelCase or snake_case filename"""
-        import re
         words = []
         # 先按下划线分割
         parts = text.split('_')
@@ -69,10 +68,22 @@ class ArkTSFileHandler(FileSystemEventHandler):
         if not os.path.exists(file_path):
             return
 
+        # [HIGH-4] 检查文件大小，防止读取超大文件导致OOM
+        try:
+            file_size = os.path.getsize(file_path)
+            if file_size > MAX_FILE_SIZE:
+                print(f"[WARN] Skipping large file: {file_path} ({file_size} bytes > {MAX_FILE_SIZE})")
+                return
+        except OSError:
+            return
+
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
             self.callback(file_path, content)
+        except FileNotFoundError:
+            # [MEDIUM#13] 文件在检查后被删除，静默忽略
+            pass
         except UnicodeDecodeError as e:
             print(f"[WARN] Skipping non-UTF-8 file: {file_path} ({e})")
         except Exception as e:
@@ -169,6 +180,14 @@ class FileWatcher:
                 for filename in filenames:
                     file_path = os.path.normpath(os.path.join(root, filename))
                     if self.handler._is_valid_file(file_path):
+                        # [HIGH-4] 检查文件大小
+                        try:
+                            file_size = os.path.getsize(file_path)
+                            if file_size > MAX_FILE_SIZE:
+                                print(f"[WARN] Skipping large file: {file_path} ({file_size} bytes)")
+                                continue
+                        except OSError:
+                            continue
                         try:
                             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                                 content = f.read()

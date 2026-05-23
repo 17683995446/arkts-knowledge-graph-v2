@@ -27,15 +27,29 @@ class MockArkTSParser:
         relationships = []
         imports = []
         
-        # Extract imports
-        import_pattern = r"import\s+\{?([^}]+)\}?\s+from\s+['\"]([^'\"]+)['\"]"
-        for match in re.finditer(import_pattern, content):
+        # Extract imports - 分别处理默认导入和命名导入
+        # 命名导入: import { Foo, Bar } from 'module'
+        named_import_pattern = r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]"
+        for match in re.finditer(named_import_pattern, content):
             imported_names = [n.strip() for n in match.group(1).split(',')]
             module_path = match.group(2)
             imports.append({
                 "module": module_path,
                 "names": imported_names,
-                "is_default": '{' not in match.group(0)
+                "is_default": False
+            })
+
+        # 默认导入: import Foo from 'module'
+        default_import_pattern = r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]"
+        for match in re.finditer(default_import_pattern, content):
+            # 跳过已匹配的命名导入
+            if '{' in content[match.start():match.start() + 50]:
+                continue
+            module_path = match.group(2)
+            imports.append({
+                "module": module_path,
+                "names": [],
+                "is_default": True
             })
         
         # Extract interfaces
@@ -128,7 +142,10 @@ class MockArkTSParser:
             method_pattern = r"(?:async\s+)?(\w+)\s*\([^)]*\)\s*:\s*(\w+|\{[^}]*\}|\w+<[^>]+>)"
             for method_match in re.finditer(method_pattern, class_body):
                 method_name = method_match.group(1)
-                if method_name not in ['constructor', 'if', 'for', 'while', 'switch']:
+                if method_name not in ['constructor', 'if', 'for', 'while', 'switch',
+                                       'catch', 'return', 'new', 'throw', 'else', 'do',
+                                       'function', 'class', 'interface', 'enum', 'type',
+                                       'import', 'export', 'from', 'const', 'let', 'var']:
                     entities.append({
                         "name": f"{class_name}.{method_name}",
                         "type": "function",
@@ -148,13 +165,27 @@ class MockArkTSParser:
         enum_pattern = r"export\s+enum\s+(\w+)"
         for match in re.finditer(enum_pattern, content):
             enum_name = match.group(1)
+            # [MEDIUM-5] 使用花括号匹配计算准确的结束位置
+            start_pos = match.end()
+            brace_count = 0
+            end_pos = start_pos
+            for i, char in enumerate(content[start_pos:]):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_pos = start_pos + i + 1
+                        break
+            if brace_count != 0:
+                end_pos = match.end()  # fallback
             entities.append({
                 "name": enum_name,
                 "type": "enum",
                 "signature": f"enum {enum_name}",
                 "docstring": None,
                 "start_line": content[:match.start()].count('\n') + 1,
-                "end_line": content[:match.end()].count('\n') + 5
+                "end_line": content[:end_pos].count('\n') + 1
             })
         
         # Extract type aliases
@@ -174,13 +205,27 @@ class MockArkTSParser:
         func_pattern = r"export\s+(?:async\s+)?function\s+(\w+)"
         for match in re.finditer(func_pattern, content):
             func_name = match.group(1)
+            # [MEDIUM-5] 使用花括号匹配计算准确的结束位置
+            start_pos = match.end()
+            brace_count = 0
+            end_pos = start_pos
+            for i, char in enumerate(content[start_pos:]):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_pos = start_pos + i + 1
+                        break
+            if brace_count != 0:
+                end_pos = match.end()  # fallback
             entities.append({
                 "name": func_name,
                 "type": "function",
                 "signature": f"function {func_name}()",
                 "docstring": None,
                 "start_line": content[:match.start()].count('\n') + 1,
-                "end_line": content[:match.end()].count('\n') + 5
+                "end_line": content[:end_pos].count('\n') + 1
             })
         
         return {

@@ -8,8 +8,9 @@ import time
 import threading
 from collections import OrderedDict
 from typing import Dict, List
+from config import MAX_NODES_DISPLAY
 from knowledge_graph_db import KnowledgeGraphDB
-from llm_parser import ArkTSParser
+from mock_llm_parser import MockArkTSParser
 from file_watcher import FileWatcher
 
 
@@ -23,7 +24,7 @@ class KnowledgeGraphService:
 
     def __init__(self, db_path: str = "knowledge_graph.db", watch_paths: list = None):
         self.db = KnowledgeGraphDB(db_path)
-        self.parser = ArkTSParser()
+        self.parser = MockArkTSParser()
         self.watcher = FileWatcher(self._handle_file_change, watch_paths)
         self.stats = {
             'files_processed': 0,
@@ -82,18 +83,29 @@ class KnowledgeGraphService:
         file_lock = self._get_file_lock(file_path)
 
         # 带指数退避的重试机制，避免静默丢弃更新
+        callback_to_fire = None
+        callback_args = None
+        processed = False  # [HIGH-3] 标记是否已成功处理
         for attempt in range(self._MAX_RETRY_ATTEMPTS):
             # [CRITICAL#1] 每次重试前检查 shutdown
             if self._shutdown_event.is_set():
                 return
             if file_lock.acquire(blocking=False):
                 try:
+                    # [R3-10] 获取锁后二次检查shutdown，防止close()竞态
+                    if self._shutdown_event.is_set():
+                        return
                     self._handle_file_change_inner(file_path, content)
+                    processed = True  # 标记已处理
+                    # [HIGH#4] 在锁内准备回调，但在锁外触发
+                    if self.on_update_callback:
+                        callback_to_fire = self.on_update_callback
+                        callback_args = (file_path, self.get_statistics())
                 except Exception as e:
                     print(f"[ERROR] Failed to process {file_path}: {e}")
                 finally:
                     file_lock.release()
-                return
+                break
             else:
                 delay = self._RETRY_DELAY_BASE * (2 ** attempt)
                 print(f"[RETRY] {file_path} is locked, retry {attempt+1}/{self._MAX_RETRY_ATTEMPTS} in {delay:.1f}s")
@@ -101,63 +113,90 @@ class KnowledgeGraphService:
                 if self._shutdown_event.wait(timeout=delay):
                     return  # 收到 shutdown 信号，退出
 
-        # 所有重试均失败，使用阻塞式获取作为最后手段
-        print(f"[WAIT] {file_path} still locked after retries, waiting...")
-        file_lock.acquire(blocking=True)
-        try:
-            if not self._shutdown_event.is_set():
-                self._handle_file_change_inner(file_path, content)
-        except Exception as e:
-            print(f"[ERROR] Failed to process {file_path} after waiting: {e}")
-        finally:
-            file_lock.release()
+        # [HIGH-3] 只有在确实未获取到锁（未处理）时，才使用阻塞等待作为最后手段
+        if not processed and not self._shutdown_event.is_set():
+            print(f"[WAIT] {file_path} still locked after retries, waiting...")
+            file_lock.acquire(blocking=True)
+            try:
+                if not self._shutdown_event.is_set():
+                    self._handle_file_change_inner(file_path, content)
+                    if self.on_update_callback:
+                        callback_to_fire = self.on_update_callback
+                        callback_args = (file_path, self.get_statistics())
+            except Exception as e:
+                print(f"[ERROR] Failed to process {file_path} after waiting: {e}")
+            finally:
+                file_lock.release()
+
+        # [HIGH#4] 在文件锁释放后触发回调，避免死锁风险
+        if callback_to_fire:
+            threading.Thread(target=callback_to_fire, args=callback_args, daemon=True).start()
 
     def _handle_file_deleted(self, file_path: str):
         """处理文件删除事件 - [CRITICAL#2] 使用文件级锁保护"""
         # [CRITICAL#2] 删除操作也需要文件级锁，防止与更新操作竞态
         file_lock = self._get_file_lock(file_path)
 
+        callback_to_fire = None
+        callback_args = None
+        processed = False  # [HIGH-3] 标记是否已成功处理
         for attempt in range(self._MAX_RETRY_ATTEMPTS):
             if self._shutdown_event.is_set():
                 return
             if file_lock.acquire(blocking=False):
                 try:
+                    # [R3-10] 获取锁后二次检查shutdown
+                    if self._shutdown_event.is_set():
+                        return
                     self._handle_file_deleted_inner(file_path)
+                    processed = True  # 标记已处理
+                    if self.on_update_callback:
+                        callback_to_fire = self.on_update_callback
+                        callback_args = (file_path, self.get_statistics())
                 except Exception as e:
                     print(f"[ERROR] Failed to delete file data for {file_path}: {e}")
                 finally:
                     file_lock.release()
-                return
+                break
             else:
                 delay = self._RETRY_DELAY_BASE * (2 ** attempt)
                 if self._shutdown_event.wait(timeout=delay):
                     return
 
-        # 最后手段：阻塞等待
-        file_lock.acquire(blocking=True)
-        try:
-            if not self._shutdown_event.is_set():
-                self._handle_file_deleted_inner(file_path)
-        except Exception as e:
-            print(f"[ERROR] Failed to delete file data for {file_path}: {e}")
-        finally:
-            file_lock.release()
+        # [HIGH-3] 只有在确实未获取到锁（未处理）时，才使用阻塞等待
+        if not processed and not self._shutdown_event.is_set():
+            file_lock.acquire(blocking=True)
+            try:
+                if not self._shutdown_event.is_set():
+                    self._handle_file_deleted_inner(file_path)
+                    processed = True
+                    if self.on_update_callback:
+                        callback_to_fire = self.on_update_callback
+                        callback_args = (file_path, self.get_statistics())
+            except Exception as e:
+                print(f"[ERROR] Failed to delete file data for {file_path}: {e}")
+            finally:
+                file_lock.release()
+
+        # [HIGH#4] 在文件锁释放后触发回调
+        if callback_to_fire:
+            threading.Thread(target=callback_to_fire, args=callback_args, daemon=True).start()
 
     def _handle_file_deleted_inner(self, file_path: str):
         """删除文件数据的实际逻辑"""
         deleted = self.db.delete_file_data(file_path)
         if deleted:
-            self.db.log_event(event_type='FILE_DELETED', file_path=file_path)
+            # [R3-24] log_event失败不影响主流程
+            try:
+                self.db.log_event(event_type='FILE_DELETED', file_path=file_path)
+            except Exception as e:
+                print(f"[WARN] Failed to log delete event for {file_path}: {e}")
             print(f"[DELETE] Removed: {file_path}")
             with self._lock:
                 self.stats['files_processed'] += 1
                 # [HIGH#5] 删除操作也更新 last_update_time
                 self.stats['last_update_time'] = time.time()
-            # [HIGH#4] on_update_callback 使用daemon线程在锁外调用
-            if self.on_update_callback:
-                callback = self.on_update_callback
-                stats = self.get_statistics()
-                threading.Thread(target=callback, args=(file_path, stats), daemon=True).start()
+            # [HIGH#4] 回调已移到 _handle_file_deleted 的锁外触发
 
     def _handle_file_change_inner(self, file_path: str, content: str):
         """实际处理逻辑 - 原子事务"""
@@ -167,22 +206,17 @@ class KnowledgeGraphService:
         if not content or not content.strip():
             return
 
-        # 1. 检查文件是否真正改变
-        unchanged, new_hash = self.db.file_exists_and_unchanged(file_path, content)
-        if unchanged:
-            return
-
         print(f"[UPDATE] Processing: {file_path}")
 
-        # 2. 先解析（不删除旧数据）
+        # 1. 解析文件
         parse_result = self.parser.parse_file(file_path, content)
         # [MEDIUM#20] 防御性检查 parse_result
-        if not parse_result:
+        if not isinstance(parse_result, dict):
             parse_result = {"entities": [], "relationships": [], "imports": []}
         entities = parse_result.get('entities', [])
         relationships = parse_result.get('relationships', [])
 
-        # 3. 在单个事务中完成 delete + insert（原子操作）
+        # 2. 定义事务回调
         def transaction_callback(conn, file_id, parse_result):
             """在事务内执行所有插入操作"""
             entity_name_to_id = {}
@@ -203,16 +237,23 @@ class KnowledgeGraphService:
             for rel in relationships:
                 source_id = entity_name_to_id.get(rel['source'])
                 if source_id is None:
+                    # [R3-03] 前缀匹配时验证后缀是行号（纯数字），防止下划线命名误匹配
+                    prefix = f"{rel['source']}_"
                     for key, eid in entity_name_to_id.items():
-                        if key.startswith(f"{rel['source']}_"):
-                            source_id = eid
-                            break
+                        if key.startswith(prefix):
+                            suffix = key[len(prefix):]
+                            if not suffix or suffix.isdigit():
+                                source_id = eid
+                                break
                 target_id = entity_name_to_id.get(rel['target'])
                 if target_id is None:
+                    prefix = f"{rel['target']}_"
                     for key, eid in entity_name_to_id.items():
-                        if key.startswith(f"{rel['target']}_"):
-                            target_id = eid
-                            break
+                        if key.startswith(prefix):
+                            suffix = key[len(prefix):]
+                            if not suffix or suffix.isdigit():
+                                target_id = eid
+                                break
                 if source_id is None or target_id is None:
                     continue
                 conn.execute(
@@ -231,16 +272,55 @@ class KnowledgeGraphService:
                     (file_id, imp['module'], names_json, imp.get('is_default', False))
                 )
 
-        self.db.update_file_transaction(file_path, content, parse_result, transaction_callback)
+            # [CRITICAL-1] 插入文件依赖关系
+            seen_modules = set()  # [R3-07] 去重，避免重复import产生冗余查询
+            for imp in parse_result.get('imports', []):
+                module_path = imp.get('module', '')
+                if not module_path or module_path in seen_modules:
+                    continue
+                seen_modules.add(module_path)
+                # [R3-06] 跳过非本地模块（系统模块、npm包等），避免无效SQL查询
+                if module_path.startswith('@') or module_path.startswith('.'):
+                    continue
+                # 尝试查找被导入模块对应的文件
+                # 将 module_path 转换为可能的文件路径
+                for ext in ('.ets', '.ts'):
+                    # 尝试多种路径转换策略
+                    possible_paths = [
+                        module_path + ext,
+                        module_path.replace('/', os.sep) + ext,
+                        os.path.join(module_path, 'index' + ext),
+                    ]
+                    for dep_path in possible_paths:
+                        dep_path = os.path.normpath(dep_path)
+                        dep_cursor = conn.execute(
+                            "SELECT id FROM files WHERE path = ?", (dep_path,)
+                        )
+                        dep_row = dep_cursor.fetchone()
+                        if dep_row:
+                            conn.execute(
+                                """INSERT OR IGNORE INTO file_dependencies (source_file_id, target_file_id)
+                                   VALUES (?, ?)""",
+                                (file_id, dep_row['id'])
+                            )
+                            break  # 找到一个匹配即可
 
-        # 4. 记录事件和更新统计
+        # 3. 在单个事务中完成 hash检查 + delete + insert（原子操作，消除 TOCTOU）
+        updated = self.db.update_file_transaction(file_path, content, parse_result, transaction_callback)
+        if not updated:
+            return  # 文件未变化，跳过
+
+        # 4. 记录事件和更新统计（[R3-01] log_event失败不影响主流程）
         duration_ms = int((time.time() - start_time) * 1000)
-        self.db.log_event(
-            event_type='FILE_UPDATED',
-            file_path=file_path,
-            details=f"Entities: {len(entities)}, Relations: {len(relationships)}",
-            duration_ms=duration_ms
-        )
+        try:
+            self.db.log_event(
+                event_type='FILE_UPDATED',
+                file_path=file_path,
+                details=f"Entities: {len(entities)}, Relations: {len(relationships)}",
+                duration_ms=duration_ms
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to log event for {file_path}: {e}")
 
         with self._lock:
             self.stats['files_processed'] += 1
@@ -250,14 +330,7 @@ class KnowledgeGraphService:
 
         print(f"[DONE] {file_path} in {duration_ms}ms - {len(entities)} entities, {len(relationships)} relations")
 
-        # [HIGH#4] on_update_callback 在文件锁释放后由调用方触发
-        # 此处仍在锁内，但 _handle_file_change 的 finally 块会先释放锁再 return
-        # 为了确保安全，将回调延迟到锁外执行
-        if self.on_update_callback:
-            callback = self.on_update_callback
-            stats = self.get_statistics()
-            # 使用后台线程调用回调，避免阻塞文件锁
-            threading.Thread(target=callback, args=(file_path, stats), daemon=True).start()
+        # [HIGH#4] 回调已移到 _handle_file_change 的锁外触发
 
     def initial_scan(self):
         """Perform initial scan of all files"""
@@ -268,21 +341,30 @@ class KnowledgeGraphService:
         print(f"[INIT] Found {len(files)} ArkTS files")
 
         processed = 0
+        skipped = 0
         for file_info in files:
             if self._shutdown_event.is_set():
                 print("[INIT] Scan interrupted by shutdown signal")
                 break
+            old_count = self.stats['files_processed']
             self._handle_file_change(file_info['path'], file_info['content'])
-            processed += 1
+            if self.stats['files_processed'] > old_count:
+                processed += 1
+            else:
+                skipped += 1
 
         duration = int(time.time() - start_time)
         print(f"[INIT] Initial scan completed in {duration}s")
 
-        self.db.log_event(
-            event_type='INITIAL_SCAN_COMPLETE',
-            details=f"Scanned {len(files)} files, processed {processed}",
-            duration_ms=duration * 1000
-        )
+        # [R4-2] log_event失败不影响主流程
+        try:
+            self.db.log_event(
+                event_type='INITIAL_SCAN_COMPLETE',
+                details=f"Scanned {len(files)} files, processed {processed}, skipped {skipped}",
+                duration_ms=duration * 1000
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to log initial scan event: {e}")
 
     def start(self):
         """Start the service"""
@@ -293,17 +375,18 @@ class KnowledgeGraphService:
         """Stop the service"""
         self._shutdown_event.set()  # 通知所有工作线程停止
         self.watcher.stop()
+        self.close()  # [HIGH#6] stop() 应确保资源正确释放
 
     def close(self):
         """清理资源 - [CRITICAL#1] 线程安全关闭"""
+        # [CRITICAL#3] 先设置 shutdown 信号，阻止新任务进入
+        self._shutdown_event.set()
+
         # [MEDIUM#15] 使用锁保护幂等检查，防止并发close
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-
-        # 1. 先设置 shutdown 信号，阻止新任务
-        self._shutdown_event.set()
 
         # 2. 停止 watcher（取消 pending timers，不再产生新事件）
         self.watcher.stop()
@@ -330,7 +413,8 @@ class KnowledgeGraphService:
         time.sleep(0.5)
 
         # 6. 清理文件锁
-        self._file_locks.clear()
+        with self._file_locks_mutex:
+            self._file_locks.clear()
 
         # 7. 最后关闭数据库（此时所有工作线程应该已完成）
         self.db.close()
@@ -351,8 +435,8 @@ class KnowledgeGraphService:
     def get_graph_data(self) -> Dict:
         """Get data for visualization"""
         return {
-            'entities': self.db.get_all_entities(limit=500),
-            'relationships': self.db.get_all_relationships(limit=1000),
-            'files': self.db.get_all_files(),
-            'dependencies': self.db.get_file_dependencies()
+            'entities': self.db.get_all_entities(limit=MAX_NODES_DISPLAY),
+            'relationships': self.db.get_all_relationships(limit=MAX_NODES_DISPLAY * 2),
+            'files': self.db.get_all_files(limit=MAX_NODES_DISPLAY * 5),  # [R3-16] 限制返回数量
+            'dependencies': self.db.get_file_dependencies(limit=MAX_NODES_DISPLAY * 5)
         }

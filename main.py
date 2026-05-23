@@ -5,9 +5,7 @@ Dynamic incremental code knowledge graph system
 import os
 import sys
 import argparse
-import time
 import signal
-from threading import Thread
 
 from config import DATABASE_PATH, WEB_HOST, WEB_PORT
 from knowledge_graph_service import KnowledgeGraphService
@@ -34,24 +32,24 @@ class KnowledgeGraphSystem:
         print(f"👀 Watch paths: {self.watch_paths}")
         print(f"🌐 Web UI: http://{self.host}:{self.port}")
         print("=" * 60)
-        
+
+        # [R3-19] 先注册信号处理器，确保 initial_scan 期间 Ctrl+C 也能优雅关闭
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
         # Initialize service
         self.service = KnowledgeGraphService(
             db_path=self.db_path,
             watch_paths=self.watch_paths
         )
-        
+
         # Perform initial scan
         self.service.initial_scan()
-        
+
         # Start file watcher
         self.service.start()
         self.running = True
-        
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        
+
         # Start web server in main thread
         try:
             run_server(self.service, self.host, self.port)
@@ -70,8 +68,13 @@ class KnowledgeGraphSystem:
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
-        self.stop()
-        sys.exit(0)
+        try:
+            self.stop()
+        except Exception as e:
+            print(f"[ERROR] Error during shutdown: {e}")
+        # [HIGH-1] SIGTERM 不会触发 KeyboardInterrupt，需要主动退出
+        import os as _os
+        _os._exit(0)
 
 
 def main():
