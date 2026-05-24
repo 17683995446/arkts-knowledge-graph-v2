@@ -182,18 +182,31 @@ class KnowledgeGraphDB:
         with self._get_connection() as conn:
             for rel in relationships:
                 # 先尝试精确匹配，再尝试复合键前缀匹配
+                # [R5-1] 添加 isdigit 验证，与 transaction_callback 保持一致
                 source_id = entity_name_to_id.get(rel['source'])
                 if source_id is None:
+                    prefix = f"{rel['source']}_"
                     for key, eid in entity_name_to_id.items():
-                        if key == rel['source'] or key.startswith(f"{rel['source']}_"):
+                        if key == rel['source']:
                             source_id = eid
                             break
+                        if key.startswith(prefix):
+                            suffix = key[len(prefix):]
+                            if not suffix or suffix.isdigit():
+                                source_id = eid
+                                break
                 target_id = entity_name_to_id.get(rel['target'])
                 if target_id is None:
+                    prefix = f"{rel['target']}_"
                     for key, eid in entity_name_to_id.items():
-                        if key == rel['target'] or key.startswith(f"{rel['target']}_"):
+                        if key == rel['target']:
                             target_id = eid
                             break
+                        if key.startswith(prefix):
+                            suffix = key[len(prefix):]
+                            if not suffix or suffix.isdigit():
+                                target_id = eid
+                                break
                 
                 if source_id is None or target_id is None:
                     continue
@@ -349,6 +362,7 @@ class KnowledgeGraphDB:
                 SELECT event_type, COUNT(*) as count FROM events 
                 WHERE created_at > datetime('now', '-1 day')
                 GROUP BY event_type
+                ORDER BY count DESC
             """)
             stats['recent_events'] = {row['event_type']: row['count'] for row in cursor.fetchall()}
             
@@ -366,8 +380,16 @@ class KnowledgeGraphDB:
     
     def search_entities(self, query: str, limit: int = 20) -> List[Dict]:
         """Search entities by name"""
-        # 防止空查询返回全部结果
-        if not query or not query.strip():
+        # [R7-HIGH-2] 防御性检查：处理 None 和非字符串类型
+        if not isinstance(query, str):
+            return []
+        query = query.strip()
+        if not query:
+            return []
+        # 过滤 Unicode 控制字符（保留普通空白字符）
+        import unicodedata
+        query = ''.join(c for c in query if unicodedata.category(c)[0] != 'C' or c in '\t\n\r')
+        if not query:
             return []
         escaped = query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
         with self._get_connection() as conn:
@@ -379,8 +401,17 @@ class KnowledgeGraphDB:
             )
             return [dict(row) for row in cursor.fetchall()]
     
-    def get_entity_details(self, entity_id: int) -> Optional[Dict]:
-        """Get detailed information about an entity including relationships"""
+    def get_entity_details(self, entity_id: int, relations_limit: int = 100) -> Optional[Dict]:
+        """Get detailed information about an entity including relationships
+        
+        [R6-2] 添加 relations_limit 参数限制返回的关系数量，防止大量关系时内存问题
+        """
+        # 边界验证
+        if relations_limit is None or relations_limit <= 0:
+            relations_limit = 100
+        elif relations_limit > 10000:
+            relations_limit = 10000
+        
         with self._get_connection() as conn:
             # Get entity info
             cursor = conn.execute(
@@ -395,25 +426,27 @@ class KnowledgeGraphDB:
             
             result = dict(entity)
             
-            # Get outgoing relationships
+            # Get outgoing relationships with limit
             cursor = conn.execute(
                 """SELECT r.*, te.name as target_name, tf.path as target_file
                    FROM relationships r
                    LEFT JOIN entities te ON r.target_entity_id = te.id
                    LEFT JOIN files tf ON r.target_file_id = tf.id
-                   WHERE r.source_entity_id = ?""",
-                (entity_id,)
+                   WHERE r.source_entity_id = ?
+                   LIMIT ?""",
+                (entity_id, relations_limit)
             )
             result['outgoing_relations'] = [dict(row) for row in cursor.fetchall()]
             
-            # Get incoming relationships
+            # Get incoming relationships with limit
             cursor = conn.execute(
                 """SELECT r.*, se.name as source_name, sf.path as source_file
                    FROM relationships r
                    LEFT JOIN entities se ON r.source_entity_id = se.id
                    LEFT JOIN files sf ON r.source_file_id = sf.id
-                   WHERE r.target_entity_id = ?""",
-                (entity_id,)
+                   WHERE r.target_entity_id = ?
+                   LIMIT ?""",
+                (entity_id, relations_limit)
             )
             result['incoming_relations'] = [dict(row) for row in cursor.fetchall()]
             

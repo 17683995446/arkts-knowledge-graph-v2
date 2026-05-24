@@ -127,6 +127,21 @@ class ArkTSFileHandler(FileSystemEventHandler):
                 except Exception as e:
                     print(f"Error handling file deletion {file_path}: {e}")
 
+    def on_moved(self, event):
+        """[R6-1] 处理文件重命名/移动事件"""
+        from watchdog.events import FileMovedEvent
+        if isinstance(event, FileMovedEvent) and not event.is_directory:
+            old_path = os.path.normpath(event.src_path)
+            new_path = os.path.normpath(event.dest_path)
+            # 处理旧路径的删除
+            if Path(old_path).suffix in SUPPORTED_EXTENSIONS:
+                try:
+                    self.callback(old_path, None)  # content=None 表示删除
+                except Exception as e:
+                    print(f"Error handling file move from {old_path}: {e}")
+            # 处理新路径的创建
+            self._schedule_update(new_path)
+
 
 class FileWatcher:
     """Watch directories for ArkTS file changes"""

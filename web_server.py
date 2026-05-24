@@ -83,21 +83,33 @@ def handle_connect():
 def handle_disconnect():
     """Handle client disconnection"""
     print('Client disconnected')
+    # [R7-MEDIUM-5] TODO: 清理客户端相关状态（如订阅、缓存等）
+    # 当前代码没有明显的状态泄漏问题，但预留清理接口
 
 
-def broadcast_update(file_path: str, stats: dict):
-    """Broadcast update to all connected clients"""
-    # [CRITICAL-2] daemon 线程中调用需要 Flask 应用上下文
-    # [R3-17] 关闭期间 emit 可能异常，需要捕获
-    try:
-        with app.app_context():
-            socketio.emit('file_updated', {
-                'file_path': file_path,
-                'stats': stats,
-                'timestamp': time.time()
-            })
-    except Exception as e:
-        print(f"[WARN] Failed to broadcast update: {e}")
+def broadcast_update(file_path: str, stats: dict, max_retries: int = 3):
+    """Broadcast update to all connected clients
+    
+    [R6-3] 添加重试机制，防止 Flask/SocketIO 暂时不可用时丢失更新通知
+    [R7-MEDIUM-6] 返回状态，调用方可以知道是否成功
+    """
+    for attempt in range(max_retries):
+        try:
+            with app.app_context():
+                socketio.emit('file_updated', {
+                    'file_path': file_path,
+                    'stats': stats,
+                    'timestamp': time.time(),
+                    'status': 'success'
+                })
+            return True  # 成功
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))  # 指数退避
+                continue
+            print(f"[WARN] Failed to broadcast update after {max_retries} retries: {e}")
+            # [R7-MEDIUM-6] 记录失败，调用方可以处理
+            return False  # 失败
 
 
 def run_server(service: KnowledgeGraphService, host: str = None, port: int = None):

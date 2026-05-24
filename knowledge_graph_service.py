@@ -230,8 +230,11 @@ class KnowledgeGraphService:
                      entity.get('signature'), entity.get('docstring'),
                      entity.get('start_line'), entity.get('end_line'))
                 )
-                composite_key = f"{entity['name']}_{entity.get('start_line', '')}"
-                entity_name_to_id[composite_key] = cursor.fetchone()['id']
+                entity_id = cursor.fetchone()['id']
+                # [R7-MEDIUM-4] 使用数据库ID作为唯一键的一部分，防止同名实体覆盖
+                # 无论 start_line 是否存在，都使用 entity_id 保证唯一性
+                composite_key = f"{entity['name']}_{entity_id}"
+                entity_name_to_id[composite_key] = entity_id
 
             # 插入关系
             for rel in relationships:

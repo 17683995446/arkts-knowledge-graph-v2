@@ -1,9 +1,9 @@
-"""
-Mock LLM Parser for testing without API calls
+"""Mock LLM Parser for testing without API calls
 Simulates parsing results for testing system robustness
 """
 import re
 import random
+import threading
 from typing import List, Dict
 
 
@@ -14,10 +14,12 @@ class MockArkTSParser:
         self.simulate_errors = simulate_errors
         self.error_rate = error_rate
         self.parse_count = 0
+        self._count_lock = threading.Lock()  # [R7-MEDIUM-3] 线程安全锁
     
     def parse_file(self, file_path: str, content: str) -> Dict:
         """Parse file using regex patterns to extract entities"""
-        self.parse_count += 1
+        with self._count_lock:
+            self.parse_count += 1
         
         # Simulate occasional errors
         if self.simulate_errors and random.random() < self.error_rate:
